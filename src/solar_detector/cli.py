@@ -20,6 +20,7 @@ load_dotenv()
 @click.option("--output", "-o", type=click.Path(), default=None, help="Path to save annotated image")
 @click.option("--no-image", is_flag=True, default=False, help="Skip saving annotated image")
 @click.option("--clear-cache", is_flag=True, default=False, help="Delete cached model weights and exit")
+@click.option("--image", "local_image", type=click.Path(exists=True), default=None, help="Use a local image file instead of fetching from Google Maps")
 def main(
     address: str | None,
     lat: float | None,
@@ -29,16 +30,18 @@ def main(
     output: str | None,
     no_image: bool,
     clear_cache: bool,
+    local_image: str | None,
 ) -> None:
     """Detect solar panels on a home using satellite imagery and YOLOv8.
 
-    Provide either an ADDRESS or --lat/--lng coordinates.
+    Provide an ADDRESS, --lat/--lng coordinates, or a local --image file.
 
     \b
     Examples:
-      solar-detect "1600 Amphitheatre Pkwy, Mountain View, CA"
-      solar-detect --lat 37.4224 --lng -122.0840
-      solar-detect "123 Main St, Austin TX" --output result.jpg --conf 0.25
+      solar-finder-3000 "1600 Amphitheatre Pkwy, Mountain View, CA"
+      solar-finder-3000 --lat 37.4224 --lng -122.0840
+      solar-finder-3000 --image screenshot.png
+      solar-finder-3000 "123 Main St, Austin TX" --output result.jpg --conf 0.25
     """
     # Lazy imports so startup is fast for --help
     from .geocoder import geocode, GeocodingError
@@ -50,34 +53,41 @@ def main(
         _clear_cache()
         return
 
-    # --- Resolve coordinates ---
-    if lat is not None and lng is not None:
-        coords = (lat, lng)
-        location_label = f"{lat:.6f}, {lng:.6f}"
-    elif address:
-        click.echo(f"Geocoding: {address}")
+    # --- Load image (local file or fetch from API) ---
+    if local_image:
+        from PIL import Image as PILImage
+        click.echo(f"Loading local image: {local_image}")
+        image = PILImage.open(local_image).convert("RGB")
+        location_label = Path(local_image).stem
+    else:
+        # --- Resolve coordinates ---
+        if lat is not None and lng is not None:
+            coords = (lat, lng)
+            location_label = f"{lat:.6f}, {lng:.6f}"
+        elif address:
+            click.echo(f"Geocoding: {address}")
+            try:
+                coords = geocode(address)
+            except GeocodingError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+            location_label = address
+            click.echo(f"Coordinates: {coords[0]:.6f}, {coords[1]:.6f}")
+        else:
+            click.echo(
+                "Error: Provide an ADDRESS, --lat/--lng coordinates, or --image path.\n"
+                "Run with --help for usage.",
+                err=True,
+            )
+            sys.exit(1)
+
+        # --- Fetch satellite image ---
+        click.echo(f"Fetching satellite image (zoom={zoom})...")
         try:
-            coords = geocode(address)
-        except GeocodingError as e:
+            image = fetch_satellite_image(coords[0], coords[1], zoom=zoom)
+        except ImageryError as e:
             click.echo(f"Error: {e}", err=True)
             sys.exit(1)
-        location_label = address
-        click.echo(f"Coordinates: {coords[0]:.6f}, {coords[1]:.6f}")
-    else:
-        click.echo(
-            "Error: Provide an ADDRESS argument or --lat/--lng coordinates.\n"
-            "Run with --help for usage.",
-            err=True,
-        )
-        sys.exit(1)
-
-    # --- Fetch satellite image ---
-    click.echo(f"Fetching satellite image (zoom={zoom})...")
-    try:
-        image = fetch_satellite_image(coords[0], coords[1], zoom=zoom)
-    except ImageryError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
 
     # --- Run detection ---
     click.echo("Running solar panel detection...")
