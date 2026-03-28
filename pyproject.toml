@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.backends.legacy:build"
 
 [project]
-name = "solar-detector"
+name = "solar-finder-3000"
 version = "0.1.0"
-description = "Detect solar panels on homes using satellite imagery and YOLOv8"
+description = "Solar Finder 3000 — detect solar panels on homes using satellite imagery and YOLOv8"
 requires-python = ">=3.10"
 dependencies = [
     "ultralytics>=8.0.0",
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-solar-detect = "solar_detector.cli:main"
+solar-finder-3000 = "solar_detector.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
