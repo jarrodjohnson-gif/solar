@@ -4,6 +4,8 @@
 # YOLO model weights
 models/*.pt
 models/*.onnx
+*.pt
+*.onnx
 
 # Output images
 output/
