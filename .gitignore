@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# YOLO model weights
+models/*.pt
+models/*.onnx
+
+# Output images
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
