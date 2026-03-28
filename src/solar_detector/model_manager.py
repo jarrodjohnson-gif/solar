@@ -13,11 +13,15 @@ import requests
 from ultralytics import YOLO
 
 # Candidate URLs tried in order — first success wins.
-# These are popular open-source solar panel YOLOv8 models.
+# Primary: ArielDrabkin/Solar-Panel-Detector — YOLOv8 trained specifically on
+# satellite solar panel imagery via Roboflow (single class: solar-panel).
+# https://github.com/ArielDrabkin/Solar-Panel-Detector
 _MODEL_URLS = [
-    # aiclusters/yolov8-solar-panel-detection (GitHub releases)
-    "https://github.com/aiclusters/yolov8-solar-panel-detection/releases/download/v1.0/best.pt",
-    # Fallback: keremberke model mirrored to GitHub
+    # Deployment-ready model (recommended by the repo)
+    "https://github.com/ArielDrabkin/Solar-Panel-Detector/raw/main/deployment/detector.pt",
+    # Best training run with mosaic augmentation
+    "https://github.com/ArielDrabkin/Solar-Panel-Detector/raw/main/models/final-mosaic-augmentation.pt",
+    # keremberke YOLOv8 solar panel model (GitHub releases)
     "https://github.com/keremberke/awesome-yolov8-models/releases/download/v1.0.0/solar-panel-detection-best.pt",
 ]
 
