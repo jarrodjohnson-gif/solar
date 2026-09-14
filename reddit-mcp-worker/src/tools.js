@@ -5,24 +5,38 @@
  * reads) and `structuredContent` matching its declared `outputSchema` (what
  * a programmatic client can consume). The MCP spec requires the structured
  * field whenever an output schema is declared.
+ *
+ * Results carry `format`: "json" when Reddit served scores and threading,
+ * "rss" when it refused and the read fell back. Renderers show scores when
+ * they exist and stay silent about them when they don't, so the model is
+ * never invited to infer ranking that isn't in the data.
  */
 
 import {
   SORTS,
   SEARCH_SORTS,
   TIME_RANGES,
-  buildFeedUrl,
   clampLimit,
   extractPostId,
-  fetchFeed,
+  fetchListing,
   pickOption,
   validateSubreddit,
   validateUsername,
 } from './reddit.js';
 
-/** Feeds carry no score or comment count; say so once rather than in every tool. */
-const FEED_CAVEAT =
-  'Served from Reddit public RSS: no vote scores or comment counts, and comment lists are flat rather than threaded.';
+const COMMENT_SORTS = ['confidence', 'top', 'new', 'controversial', 'old', 'qa'];
+
+/**
+ * Say what the data supports, which differs by the path that answered.
+ * @param {object} feed
+ * @returns {string}
+ */
+function caveatFor(feed) {
+  if (feed.format === 'json') {
+    return 'Served from Reddit public JSON: vote scores and comment counts are real values from Reddit.';
+  }
+  return 'Served from Reddit public RSS: no vote scores or comment counts, and comment lists are flat rather than threaded. Do not describe any result as top-voted or infer consensus from ordering.';
+}
 
 const ENTRY_PROPERTIES = {
   id: { type: 'string', description: 'Reddit base-36 ID' },
@@ -32,7 +46,11 @@ const ENTRY_PROPERTIES = {
   subreddit: { type: 'string' },
   url: { type: 'string' },
   published: { type: 'string', description: 'ISO 8601 timestamp' },
-  body: { type: 'string', description: 'Plain-text body, tags stripped' },
+  body: { type: 'string', description: 'Plain text' },
+  score: { type: 'integer', description: 'Net votes. Absent on the RSS fallback.' },
+  num_comments: { type: 'integer', description: 'Absent on the RSS fallback.' },
+  upvote_ratio: { type: 'number', description: 'Absent on the RSS fallback.' },
+  depth: { type: 'integer', description: 'Reply nesting level. Absent on the RSS fallback.' },
 };
 
 const LISTING_OUTPUT = {
@@ -40,18 +58,35 @@ const LISTING_OUTPUT = {
   properties: {
     query: { type: 'string' },
     count: { type: 'integer' },
-    source: { type: 'string', description: 'The Reddit feed URL that was read' },
+    format: { type: 'string', enum: ['json', 'rss'], description: 'Which Reddit surface answered' },
+    ranked: { type: 'boolean', description: 'True when vote scores were available' },
+    source: { type: 'string', description: 'The Reddit URL that was read' },
     cached: { type: 'boolean' },
-    entries: {
-      type: 'array',
-      items: { type: 'object', properties: ENTRY_PROPERTIES },
-    },
+    entries: { type: 'array', items: { type: 'object', properties: ENTRY_PROPERTIES } },
   },
-  required: ['count', 'entries'],
+  required: ['count', 'entries', 'format'],
 };
 
 /**
- * Render one entry as a compact markdown block.
+ * Compact "42 points · 7 comments" line, omitted entirely when unavailable.
+ * @param {object} entry
+ * @returns {string}
+ */
+function renderStats(entry) {
+  const bits = [];
+  if (typeof entry.score === 'number') {
+    bits.push(`${entry.score} point${entry.score === 1 ? '' : 's'}`);
+  }
+  if (typeof entry.num_comments === 'number') {
+    bits.push(`${entry.num_comments} comment${entry.num_comments === 1 ? '' : 's'}`);
+  }
+  if (typeof entry.upvote_ratio === 'number') {
+    bits.push(`${Math.round(entry.upvote_ratio * 100)}% upvoted`);
+  }
+  return bits.join(' · ');
+}
+
+/**
  * @param {object} entry
  * @param {number} index
  * @returns {string}
@@ -62,6 +97,8 @@ function renderEntry(entry, index) {
   lines.push(`### ${index}. ${heading}`);
 
   const meta = [];
+  const stats = renderStats(entry);
+  if (stats) meta.push(stats);
   if (entry.subreddit) meta.push(`r/${entry.subreddit}`);
   if (entry.author) meta.push(`u/${entry.author}`);
   if (entry.published) meta.push(entry.published.slice(0, 10));
@@ -85,11 +122,11 @@ function renderListing(heading, feed, note) {
   const parts = [`## ${heading}`];
   if (note) parts.push(note);
   if (feed.entries.length === 0) {
-    parts.push('', 'No results. Reddit returned an empty feed for this query.');
+    parts.push('', 'No results. Reddit returned an empty listing for this query.');
   } else {
     parts.push('', ...feed.entries.map((entry, i) => renderEntry(entry, i + 1)));
   }
-  parts.push('', `_${FEED_CAVEAT}_`);
+  parts.push('', `_${caveatFor(feed)}_`);
   return parts.join('\n\n');
 }
 
@@ -102,6 +139,8 @@ function structuredListing(feed, query) {
   return {
     query,
     count: feed.entries.length,
+    format: feed.format,
+    ranked: feed.entries.some((entry) => typeof entry.score === 'number'),
     source: feed.source,
     cached: Boolean(feed.cached),
     entries: feed.entries,
@@ -113,8 +152,7 @@ export const TOOLS = [
     name: 'search_reddit',
     title: 'Search Reddit',
     description:
-      'Full-text search across Reddit, or within one subreddit when `subreddit` is set. Use this when looking for discussion of a topic rather than browsing a specific community. ' +
-      FEED_CAVEAT,
+      'Full-text search across Reddit, or within one subreddit when `subreddit` is set. Use this when looking for discussion of a topic rather than browsing a specific community. Results include vote scores when Reddit serves them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -138,16 +176,17 @@ export const TOOLS = [
       const time = pickOption(args.time, TIME_RANGES, 'all', 'time');
       const limit = clampLimit(args.limit);
 
-      let path = '/search.rss';
       const params = { q: query, sort, t: time, limit };
+      let basePath = '/search';
+      let scope = '';
       if (args.subreddit) {
         const sub = validateSubreddit(args.subreddit);
-        path = `/r/${sub}/search.rss`;
+        basePath = `/r/${sub}/search`;
         params.restrict_sr = '1';
+        scope = ` in r/${sub}`;
       }
 
-      const feed = await fetchFeed(buildFeedUrl(path, params), env, ctx);
-      const scope = args.subreddit ? ` in r/${validateSubreddit(args.subreddit)}` : '';
+      const feed = await fetchListing(basePath, params, env, ctx);
       return {
         text: renderListing(
           `Search: "${query}"${scope}`,
@@ -163,8 +202,7 @@ export const TOOLS = [
     name: 'browse_subreddit',
     title: 'Browse a subreddit',
     description:
-      'List posts from one subreddit by hot, new, top, rising, or controversial. Use this to see what a community is discussing right now. ' +
-      FEED_CAVEAT,
+      'List posts from one subreddit by hot, new, top, rising, or controversial. Use this to see what a community is discussing. Results include vote scores when Reddit serves them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -190,7 +228,7 @@ export const TOOLS = [
       const params = { limit };
       if (sort === 'top' || sort === 'controversial') params.t = time;
 
-      const feed = await fetchFeed(buildFeedUrl(`/r/${sub}/${sort}.rss`, params), env, ctx);
+      const feed = await fetchListing(`/r/${sub}/${sort}`, params, env, ctx);
       return {
         text: renderListing(`r/${sub} — ${sort}`, feed),
         structured: structuredListing(feed, `r/${sub}/${sort}`),
@@ -202,7 +240,7 @@ export const TOOLS = [
     name: 'get_thread',
     title: 'Read a thread',
     description:
-      'Fetch one post and its comments. Accepts a reddit.com permalink, a t3_ thing ID, or a bare post ID. Use this after a search to read what people actually said. Comments arrive flat and unscored, so treat ordering as chronological rather than as consensus.',
+      'Fetch one post and its comments. Accepts a reddit.com permalink, a t3_ thing ID, or a bare post ID. Use this after a search to read what people actually said. When Reddit serves scores, comments carry point counts and reply nesting, and `sort: "top"` ranks them by score.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -212,8 +250,9 @@ export const TOOLS = [
         },
         sort: {
           type: 'string',
-          enum: ['confidence', 'top', 'new', 'controversial', 'old', 'qa'],
-          description: 'Comment ordering requested from Reddit. Default confidence (Reddit\'s "best").',
+          enum: COMMENT_SORTS,
+          description:
+            'Comment ordering. "top" ranks by score, "confidence" is Reddit\'s "best". Default confidence.',
         },
         comment_limit: {
           type: 'integer',
@@ -229,40 +268,45 @@ export const TOOLS = [
       properties: {
         post: { type: 'object', properties: ENTRY_PROPERTIES },
         comment_count: { type: 'integer' },
+        format: { type: 'string', enum: ['json', 'rss'] },
+        ranked: { type: 'boolean', description: 'True when comments carry vote scores' },
         comments: { type: 'array', items: { type: 'object', properties: ENTRY_PROPERTIES } },
         source: { type: 'string' },
         cached: { type: 'boolean' },
       },
-      required: ['comment_count', 'comments'],
+      required: ['comment_count', 'comments', 'format'],
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
     async handler(args, env, ctx) {
       const postId = extractPostId(args.post);
-      const sort = pickOption(
-        args.sort,
-        ['confidence', 'top', 'new', 'controversial', 'old', 'qa'],
-        'confidence',
-        'sort',
-      );
+      const sort = pickOption(args.sort, COMMENT_SORTS, 'confidence', 'sort');
       const limit = clampLimit(args.comment_limit);
 
-      const feed = await fetchFeed(
-        buildFeedUrl(`/comments/${postId}.rss`, { sort, limit }),
-        env,
-        ctx,
-      );
+      const feed = await fetchListing(`/comments/${postId}`, { sort, limit }, env, ctx);
 
-      // Comment feeds normally contain only t1_ entries, with the post title at
-      // feed level. Some responses include the post itself; handle both.
-      const post = feed.entries.find((entry) => entry.type === 'post') || null;
-      const comments = feed.entries.filter((entry) => entry.type !== 'post').slice(0, limit);
+      // The JSON path separates the post for us; the RSS path returns only
+      // comment entries with the title at feed level.
+      const post = feed.post || feed.entries.find((entry) => entry.type === 'post') || null;
+      let comments = feed.entries.filter((entry) => entry.type !== 'post');
+
+      // Reddit already returns the requested order, but with real scores in
+      // hand we can guarantee it rather than trust it.
+      const ranked = comments.some((comment) => typeof comment.score === 'number');
+      if (ranked && sort === 'top') {
+        comments = [...comments].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+      }
+      comments = comments.slice(0, limit);
 
       const heading = post?.title || feed.title || `Post ${postId}`;
       const parts = [`## ${heading}`];
+      const postStats = post ? renderStats(post) : '';
+      if (postStats) parts.push(postStats);
       if (post?.body) parts.push('', post.body);
-      if (post?.url || feed.source) parts.push('', post?.url || `https://www.reddit.com/comments/${postId}`);
+      parts.push('', post?.url || `https://www.reddit.com/comments/${postId}`);
 
-      parts.push('', `### ${comments.length} comment${comments.length === 1 ? '' : 's'}`);
+      const label = ranked && sort === 'top' ? ', ranked by score' : '';
+      parts.push('', `### ${comments.length} comment${comments.length === 1 ? '' : 's'}${label}`);
+
       if (comments.length === 0) {
         parts.push('', 'No comments returned. The thread may be empty, locked, or removed.');
       } else {
@@ -270,18 +314,26 @@ export const TOOLS = [
           '',
           ...comments.map((comment, i) => {
             const who = comment.author ? `u/${comment.author}` : 'unknown';
-            const when = comment.published ? ` · ${comment.published.slice(0, 10)}` : '';
-            return `**${i + 1}. ${who}**${when}\n\n${comment.body || '(empty)'}`;
+            const bits = [renderStats(comment), comment.published?.slice(0, 10)].filter(Boolean);
+            const meta = bits.length ? ` — ${bits.join(' · ')}` : '';
+            const indent = '  '.repeat(Math.min(comment.depth ?? 0, 5));
+            const body = (comment.body || '(empty)')
+              .split('\n')
+              .map((line) => (indent ? indent + line : line))
+              .join('\n');
+            return `**${i + 1}. ${who}**${meta}\n\n${body}`;
           }),
         );
       }
-      parts.push('', `_${FEED_CAVEAT}_`);
+      parts.push('', `_${caveatFor(feed)}_`);
 
       return {
         text: parts.join('\n\n'),
         structured: {
           post,
           comment_count: comments.length,
+          format: feed.format,
+          ranked,
           comments,
           source: feed.source,
           cached: Boolean(feed.cached),
@@ -292,10 +344,9 @@ export const TOOLS = [
 
   {
     name: 'get_user_activity',
-    title: 'Read a user\'s public activity',
+    title: "Read a user's public activity",
     description:
-      'List a Reddit user\'s recent public posts and comments. Only public activity is visible. ' +
-      FEED_CAVEAT,
+      "List a Reddit user's recent public posts and comments. Only public activity is visible.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -303,7 +354,8 @@ export const TOOLS = [
         kind: {
           type: 'string',
           enum: ['overview', 'submitted', 'comments'],
-          description: 'overview mixes both; submitted is posts only; comments is comments only. Default overview.',
+          description:
+            'overview mixes both; submitted is posts only; comments is comments only. Default overview.',
         },
         limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Max items, default 25.' },
       },
@@ -316,8 +368,8 @@ export const TOOLS = [
       const kind = pickOption(args.kind, ['overview', 'submitted', 'comments'], 'overview', 'kind');
       const limit = clampLimit(args.limit);
 
-      const path = kind === 'overview' ? `/user/${username}.rss` : `/user/${username}/${kind}.rss`;
-      const feed = await fetchFeed(buildFeedUrl(path, { limit }), env, ctx);
+      const basePath = kind === 'overview' ? `/user/${username}` : `/user/${username}/${kind}`;
+      const feed = await fetchListing(basePath, { limit }, env, ctx);
       return {
         text: renderListing(`u/${username} — ${kind}`, feed),
         structured: structuredListing(feed, `u/${username}/${kind}`),
@@ -345,11 +397,7 @@ export const TOOLS = [
       if (!query) throw new Error('query must not be empty.');
       const limit = clampLimit(args.limit);
 
-      const feed = await fetchFeed(
-        buildFeedUrl('/subreddits/search.rss', { q: query, limit }),
-        env,
-        ctx,
-      );
+      const feed = await fetchListing('/subreddits/search', { q: query, limit }, env, ctx);
       return {
         text: renderListing(`Subreddits matching "${query}"`, feed),
         structured: structuredListing(feed, query),

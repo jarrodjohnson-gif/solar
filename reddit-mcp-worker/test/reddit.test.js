@@ -12,7 +12,7 @@ import {
   validateSubreddit,
   validateUsername,
 } from '../src/reddit.js';
-import { LISTING_FEED, stubFetch } from './fixtures.js';
+import { LISTING_FEED, stubFetch, stubFetchRssOnly } from './fixtures.js';
 
 test('validateSubreddit accepts bare and prefixed names', () => {
   assert.equal(validateSubreddit('laundry'), 'laundry');
@@ -88,7 +88,7 @@ test('buildFeedUrl cannot be escaped to another host', () => {
 });
 
 test('fetchFeed parses a feed and sends a descriptive User-Agent', async () => {
-  const calls = stubFetch(LISTING_FEED);
+  const calls = stubFetchRssOnly();
   const feed = await fetchFeed('https://www.reddit.com/r/laundry/hot.rss', {
     REDDIT_USER_AGENT: 'test-agent/1.0',
     CACHE_TTL_SECONDS: '0',
@@ -99,7 +99,7 @@ test('fetchFeed parses a feed and sends a descriptive User-Agent', async () => {
 });
 
 test('fetchFeed maps Reddit rate limiting to an actionable message', async () => {
-  stubFetch('', { status: 429 });
+  stubFetch({ xml: '', status: 429, jsonStatus: 429 });
   await assert.rejects(
     () => fetchFeed('https://www.reddit.com/r/laundry/hot.rss', { CACHE_TTL_SECONDS: '0' }),
     (error) => {
@@ -113,13 +113,13 @@ test('fetchFeed maps Reddit rate limiting to an actionable message', async () =>
 });
 
 test('fetchFeed explains 403 and 404 distinctly', async () => {
-  stubFetch('', { status: 403 });
+  stubFetch({ xml: '', status: 403, jsonStatus: 403 });
   await assert.rejects(
     () => fetchFeed('https://www.reddit.com/r/x/hot.rss', { CACHE_TTL_SECONDS: '0' }),
     /private, quarantined, banned or deleted/,
   );
 
-  stubFetch('', { status: 404 });
+  stubFetch({ xml: '', status: 404, jsonStatus: 404 });
   await assert.rejects(
     () => fetchFeed('https://www.reddit.com/r/x/hot.rss', { CACHE_TTL_SECONDS: '0' }),
     /does not exist/,
@@ -127,7 +127,7 @@ test('fetchFeed explains 403 and 404 distinctly', async () => {
 });
 
 test('fetchFeed rejects a non-feed body', async () => {
-  stubFetch('<html>blocked</html>');
+  stubFetch({ xml: '<html>blocked</html>' });
   await assert.rejects(
     () => fetchFeed('https://www.reddit.com/r/x/hot.rss', { CACHE_TTL_SECONDS: '0' }),
     /not an Atom feed/,

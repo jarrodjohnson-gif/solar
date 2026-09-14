@@ -1,13 +1,18 @@
 /**
  * Reddit feed access.
  *
- * Everything here goes through Reddit's public `.rss` endpoints, which sit
- * outside the Data API: no OAuth client, no Responsible Builder approval, no
- * per-call pricing. The tradeoff is that feeds omit scores and comment counts,
- * and comment listings are flat rather than threaded.
+ * Reddit exposes every public listing twice outside the priced Data API: as
+ * `.json` and as `.rss`. Neither needs credentials. JSON carries vote scores,
+ * comment counts and real reply nesting; RSS carries none of that but is
+ * served more permissively.
+ *
+ * So reads try JSON first and fall back to RSS when Reddit refuses it. Callers
+ * get whichever succeeded, tagged with `format`, and the extra fields simply
+ * go missing on the RSS path rather than the read failing.
  */
 
 import { parseFeed } from './atom.js';
+import { looksLikeRedditJson, parseJsonResponse } from './json.js';
 
 const REDDIT_BASE = 'https://www.reddit.com';
 
@@ -125,18 +130,62 @@ export function buildFeedUrl(path, params = {}) {
 }
 
 /**
- * Fetch and parse a feed, serving from Cloudflare's edge cache when possible.
+ * Build both representations of one Reddit path.
+ *
+ * @param {string} basePath extensionless, e.g. "/r/laundry/hot"
+ * @param {Record<string, string|number|undefined>} [params]
+ * @returns {{json: string, rss: string}}
+ */
+export function buildUrls(basePath, params = {}) {
+  // raw_json=1 stops Reddit HTML-escaping body text in JSON responses.
+  return {
+    json: buildFeedUrl(`${basePath}.json`, { ...params, raw_json: 1 }),
+    rss: buildFeedUrl(`${basePath}.rss`, params),
+  };
+}
+
+/**
+ * Map a non-OK Reddit response to an error explaining what to do about it.
+ *
+ * @param {number} status
+ * @returns {RedditFetchError}
+ */
+function describeFailure(status) {
+  if (status === 429) {
+    return new RedditFetchError(
+      'Reddit rate-limited this request (HTTP 429). Cloudflare Workers share egress IPs, so this can happen in bursts. Wait a minute and retry; raising CACHE_TTL_SECONDS makes it rarer.',
+      429,
+    );
+  }
+  if (status === 403) {
+    // Two very different causes share this status: the content is restricted,
+    // or Reddit is refusing this egress IP. Naming only the first sends people
+    // hunting for a problem with their query that may not exist.
+    return new RedditFetchError(
+      "Reddit refused this request (HTTP 403). Either the subreddit or user is private, quarantined, banned or deleted, or Reddit is blocking this server's IP address. If other subreddits work, it is the former; if every request fails, it is the latter.",
+      403,
+    );
+  }
+  if (status === 404) {
+    return new RedditFetchError('Reddit returned 404 — that subreddit, user, or post does not exist.', 404);
+  }
+  return new RedditFetchError(`Reddit returned HTTP ${status}.`, status);
+}
+
+/**
+ * Fetch one URL as text, served from Cloudflare's edge cache when possible.
  *
  * Caching is not just a latency win: it is the main defence against Reddit
  * rate-limiting the Worker's shared egress IPs. Repeated identical reads cost
  * Reddit nothing.
  *
  * @param {string} url
- * @param {{ REDDIT_USER_AGENT?: string, CACHE_TTL_SECONDS?: string }} env
- * @param {{ waitUntil?: (p: Promise<unknown>) => void }} [ctx]
- * @returns {Promise<object>}
+ * @param {string} accept
+ * @param {object} env
+ * @param {{waitUntil?: (p: Promise<unknown>) => void}} [ctx]
+ * @returns {Promise<{text: string, cached: boolean}>}
  */
-export async function fetchFeed(url, env = {}, ctx = undefined) {
+async function fetchText(url, accept, env = {}, ctx = undefined) {
   const ttl = Number.parseInt(env.CACHE_TTL_SECONDS ?? '300', 10);
   const userAgent =
     env.REDDIT_USER_AGENT || 'reddit-mcp-worker/1.0 (Cloudflare Worker; +https://github.com)';
@@ -146,63 +195,109 @@ export async function fetchFeed(url, env = {}, ctx = undefined) {
 
   if (cache && ttl > 0) {
     const hit = await cache.match(cacheKey);
-    if (hit) {
-      const xml = await hit.text();
-      return { ...parseFeed(xml), cached: true, source: url };
-    }
+    if (hit) return { text: await hit.text(), cached: true };
   }
 
   let response;
   try {
     response = await fetch(url, {
-      headers: {
-        'User-Agent': userAgent,
-        Accept: 'application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
-      },
+      headers: { 'User-Agent': userAgent, Accept: accept },
     });
   } catch (cause) {
     throw new RedditFetchError(`Could not reach Reddit: ${cause.message}`, 502);
   }
 
-  if (response.status === 429) {
-    throw new RedditFetchError(
-      'Reddit rate-limited this request (HTTP 429). Cloudflare Workers share egress IPs, so this can happen in bursts. Wait a minute and retry; raising CACHE_TTL_SECONDS makes it rarer.',
-      429,
-    );
-  }
-  if (response.status === 403) {
-    // Two very different causes share this status: the content is restricted,
-    // or Reddit is refusing this egress IP. Naming only the first sends people
-    // hunting for a problem with their query that may not exist.
-    throw new RedditFetchError(
-      'Reddit refused this request (HTTP 403). Either the subreddit or user is private, quarantined, banned or deleted, or Reddit is blocking this server\'s IP address. If other subreddits work, it is the former; if every request fails, it is the latter.',
-      403,
-    );
-  }
-  if (response.status === 404) {
-    throw new RedditFetchError('Reddit returned 404 — that subreddit, user, or post does not exist.', 404);
-  }
-  if (!response.ok) {
-    throw new RedditFetchError(`Reddit returned HTTP ${response.status}.`, response.status);
-  }
+  if (!response.ok) throw describeFailure(response.status);
 
-  const xml = await response.text();
+  const text = await response.text();
 
   if (cache && ttl > 0) {
-    const cacheable = new Response(xml, {
-      headers: {
-        'Content-Type': 'application/atom+xml; charset=utf-8',
-        'Cache-Control': `public, max-age=${ttl}`,
-      },
-    });
-    const write = cache.put(cacheKey, cacheable);
+    const write = cache.put(
+      cacheKey,
+      new Response(text, { headers: { 'Cache-Control': `public, max-age=${ttl}` } }),
+    );
     if (ctx?.waitUntil) ctx.waitUntil(write);
     else await write;
   }
 
-  const parsed = parseFeed(xml);
-  if (parsed.entries.length === 0 && !/<feed[\s>]/i.test(xml)) {
+  return { text, cached: false };
+}
+
+/**
+ * Fetch and parse an Atom feed.
+ *
+ * @param {string} url
+ * @param {object} env
+ * @param {object} [ctx]
+ * @returns {Promise<object>}
+ */
+export async function fetchFeed(url, env = {}, ctx = undefined) {
+  const { text, cached } = await fetchText(
+    url,
+    'application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+    env,
+    ctx,
+  );
+  const parsed = parseFeed(text);
+  if (parsed.entries.length === 0 && !/<feed[\s>]/i.test(text)) {
     throw new RedditFetchError('Reddit returned a response that was not an Atom feed.', 502);
   }
-  return { ...parsed, cached: false, source: url };
+  return { ...parsed, format: 'rss', cached, source: url };
+}
+
+/**
+ * Fetch and parse a JSON listing.
+ *
+ * @param {string} url
+ * @param {object} env
+ * @param {object} [ctx]
+ * @returns {Promise<object>}
+ */
+export async function fetchJson(url, env = {}, ctx = undefined) {
+  const { text, cached } = await fetchText(url, 'application/json', env, ctx);
+
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new RedditFetchError('Reddit returned a response that was not JSON.', 502);
+  }
+  if (!looksLikeRedditJson(payload)) {
+    throw new RedditFetchError('Reddit returned JSON in an unexpected shape.', 502);
+  }
+
+  return { ...parseJsonResponse(payload), format: 'json', cached, source: url };
+}
+
+/**
+ * Read a Reddit path, preferring JSON for its scores and falling back to RSS.
+ *
+ * Falls back on the failures that mean "JSON specifically is unavailable":
+ * a 403 refusal, or a body that is not the JSON we expect. A 404 means the
+ * content does not exist on either path, and a 429 means Reddit is already
+ * rate-limiting us, so neither is retried against RSS.
+ *
+ * @param {string} basePath extensionless Reddit path
+ * @param {Record<string, string|number|undefined>} params
+ * @param {object} env
+ * @param {object} [ctx]
+ * @returns {Promise<object>}
+ */
+export async function fetchListing(basePath, params, env = {}, ctx = undefined) {
+  const urls = buildUrls(basePath, params);
+
+  if (env.FORCE_RSS === 'true' || env.FORCE_RSS === true) {
+    return fetchFeed(urls.rss, env, ctx);
+  }
+
+  try {
+    return await fetchJson(urls.json, env, ctx);
+  } catch (cause) {
+    const retryable =
+      cause instanceof RedditFetchError && (cause.status === 403 || cause.status === 502);
+    if (!retryable) throw cause;
+
+    const feed = await fetchFeed(urls.rss, env, ctx);
+    return { ...feed, fallbackFrom: 'json', fallbackReason: cause.message };
+  }
 }

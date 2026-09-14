@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import worker from '../src/index.js';
-import { LISTING_FEED, stubFetch } from './fixtures.js';
+import { stubFetch } from './fixtures.js';
 
 const ENV = { CACHE_TTL_SECONDS: '0', REDDIT_USER_AGENT: 'test/1.0' };
 const CTX = { waitUntil() {} };
@@ -29,7 +29,7 @@ test('POST /mcp serves JSON-RPC', async () => {
 });
 
 test('POST /mcp runs a tool end to end', async () => {
-  stubFetch(LISTING_FEED);
+  stubFetch();
   const response = await worker.fetch(
     post({
       jsonrpc: '2.0',

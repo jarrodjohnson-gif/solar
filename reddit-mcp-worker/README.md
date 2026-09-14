@@ -4,9 +4,14 @@ A read-only Reddit MCP server that runs on Cloudflare Workers' free tier.
 
 Reddit's Data API closed self-service signup in November 2025 — new OAuth
 credentials now need manual approval that personal projects are often refused.
-Reddit's **public RSS feeds were never part of that priced surface**, so they
-still serve every public subreddit, user page, search and comment thread with
-no credentials at all. This wraps those feeds as an MCP server.
+But Reddit's **public web surface was never part of that priced API**: every
+listing is served both as `.json` and as `.rss`, neither needing credentials.
+This wraps them as an MCP server.
+
+Reads try **JSON first** — it carries vote scores, comment counts and real
+reply nesting — and fall back to **RSS** if Reddit refuses. Whichever answered
+is reported as `format` on every result, so you always know whether the scores
+you are looking at are real or absent.
 
 The result works on **iOS**, where a local `stdio` MCP server cannot: the Worker
 is a remote connector reached over HTTPS, so there is no process to run on your
@@ -15,6 +20,7 @@ device.
 | | |
 |---|---|
 | **Cost** | $0 — Workers free tier is 100,000 requests/day |
+| **Ranking** | Vote scores and comment counts on the JSON path |
 | **Reddit credentials** | None |
 | **Third parties** | None; you host it |
 | **Dependencies** | None at runtime |
@@ -23,13 +29,22 @@ device.
 
 ## Deploy
 
-You need a free Cloudflare account. From this directory:
+You need a computer (this cannot be done from a phone) and a free Cloudflare
+account. Clone the repo first — the four commands below run inside the cloned
+`reddit-mcp-worker/` directory, not on their own:
 
 ```bash
-npm install
-npx wrangler login
+git clone https://github.com/jarrodjohnson-gif/solar.git
+cd solar
+git checkout claude/reddit-laundry-advice-ttnv03
+cd reddit-mcp-worker
+
+npm install          # installs wrangler
+npx wrangler login   # opens a browser to authorise Cloudflare
 npm run deploy
 ```
+
+`wrangler login` opens a browser tab; approve it and return to the terminal.
 
 Wrangler prints your URL. The MCP endpoint is that URL plus `/mcp`:
 
@@ -60,19 +75,37 @@ works in the iOS app too.
 | `get_thread` | Fetch a post and its comments, by URL or ID |
 | `get_user_activity` | A user's recent public posts and comments |
 
-## What RSS does not carry
+## Ranking, and when you lose it
 
-This is the real tradeoff, and it is worth understanding before you rely on it:
+`get_thread` with `sort: "top"` ranks comments by score, highest first —
+verified against the returned values rather than trusting Reddit's ordering.
+Listings show `42 points · 7 comments · 97% upvoted` when those numbers exist.
 
-- **No vote scores and no comment counts.** Nothing here can tell you which
-  answer the community upvoted. The server's own instructions tell the model not
-  to claim otherwise, but it is a genuine ceiling, not a formatting quirk.
-- **Comments are flat**, not threaded — replies are not linked to parents.
-- **Ordering is roughly chronological.** Requesting `sort: "top"` asks Reddit
-  for that order, but without scores you cannot verify what you got.
+All of that comes from the JSON path. If Reddit refuses JSON from your Worker's
+IP, reads fall back to RSS and you lose:
 
-Paid Reddit MCP services built on RSS share these limits. Only the authenticated
-Data API carries scores.
+- **Vote scores and comment counts.** Nothing can then tell you which answer the
+  community upvoted.
+- **Reply nesting.** Comments arrive flat, with no parent links.
+- **Meaningful ordering.** Requesting `top` still asks Reddit for that order,
+  but without scores it cannot be verified.
+
+Every result carries `format: "json" | "rss"` and `ranked: true | false`, and
+the rendered text states which surface answered. On the RSS path the server
+explicitly instructs the model not to describe anything as top-voted or infer
+consensus from ordering, because that information genuinely is not present.
+
+Check which path your deployment gets:
+
+```bash
+curl -s -X POST https://<your-worker>/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browse_subreddit","arguments":{"subreddit":"laundry","limit":2}}}' \
+  | grep -o '"format":"[a-z]*"'
+```
+
+`"format":"json"` means you have scores. `"format":"rss"` means you don't, and
+the reason is in the fallback message.
 
 ## Configuration
 
@@ -82,6 +115,7 @@ Set in `wrangler.toml`, or as secrets via `npx wrangler secret put <NAME>`.
 |---|---|---|
 | `REDDIT_USER_AGENT` | a generic string | Reddit asks for a descriptive agent. Point it at a real repo or contact URL. |
 | `CACHE_TTL_SECONDS` | `300` | Edge-cache lifetime for Reddit responses. |
+| `FORCE_RSS` | unset | Set to `"true"` to skip the JSON attempt entirely. |
 | `AUTH_TOKEN` | unset | Optional. When set, requests need it. |
 
 ### Rate limiting
@@ -106,7 +140,7 @@ most connector UIs let you paste a URL but not a custom header.
 ## Development
 
 ```bash
-npm test          # 64 tests, no network, no dependencies
+npm test          # 81 tests, no network, no dependencies
 npm run dev       # local workerd runtime on :8787
 npm run tail      # stream logs from the deployed Worker
 ```
@@ -136,7 +170,8 @@ tool arguments cannot reshape the request path or point it at another host.
 | `src/index.js` | Worker entry: routing, CORS, optional auth |
 | `src/mcp.js` | JSON-RPC dispatch, protocol negotiation |
 | `src/tools.js` | Tool schemas, handlers, output rendering |
-| `src/reddit.js` | Feed URLs, validation, fetching, caching |
+| `src/reddit.js` | URLs, validation, JSON-first fetching with RSS fallback, caching |
+| `src/json.js` | Reddit JSON listings, comment-tree flattening |
 | `src/atom.js` | Atom parsing, HTML-to-text |
 
 ## Licence
