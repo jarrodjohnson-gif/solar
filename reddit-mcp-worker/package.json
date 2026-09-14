@@ -1,0 +1,16 @@
+{
+  "name": "reddit-mcp-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Reddit MCP server on Cloudflare Workers, backed by public RSS feeds",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.js",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
