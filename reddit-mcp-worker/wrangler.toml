@@ -1,0 +1,28 @@
+name = "reddit-mcp"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Lets the Worker reuse Cloudflare's stock fetch/cache behaviour without
+# bundling a Node shim. No Durable Objects, no KV, no paid bindings.
+
+[observability]
+enabled = true
+
+[vars]
+# Reddit asks for a descriptive User-Agent. Point it at something real —
+# a contact URL or repo — so your traffic is attributable if they ever look.
+REDDIT_USER_AGENT = "reddit-mcp-worker/1.0 (+https://github.com/jarrodjohnson-gif/solar)"
+
+# Edge-cache TTL for Reddit responses, in seconds. This is the main defence
+# against rate limiting: Workers share egress IPs, so repeated identical
+# reads should not reach Reddit. Raise it if you see HTTP 429.
+CACHE_TTL_SECONDS = "300"
+
+# Set to "true" to skip the JSON path entirely and read only RSS. Useful if
+# Reddit starts refusing JSON from your Worker and you would rather not pay
+# the failed request on every read.
+# FORCE_RSS = "false"
+
+# Optional. Leave unset for an open endpoint. To require a token:
+#   npx wrangler secret put AUTH_TOKEN
+# Then connect to https://<worker>.workers.dev/mcp/<token>
