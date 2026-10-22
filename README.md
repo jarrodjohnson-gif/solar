@@ -9,7 +9,7 @@ Provide an address or coordinates — Solar Finder 3000 fetches a satellite imag
 ## Quick Start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/jarrodjohnson-gif/solar.git
 cd solar
 pip install -e .
 cp .env.example .env
@@ -174,3 +174,7 @@ Address / Coordinates
 ## License
 
 MIT
+
+## License
+
+MIT. See [LICENSE](LICENSE).
